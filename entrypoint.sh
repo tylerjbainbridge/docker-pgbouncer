@@ -7,38 +7,7 @@ set -e
 # https://pgbouncer.github.io/config.html
 
 PG_CONFIG_DIR=/etc/pgbouncer
-
-if [ -n "$DATABASE_URL" ]; then
-  # Thanks to https://stackoverflow.com/a/17287984/146289
-
-  # Allow to pass values like dj-database-url / django-environ accept
-  proto="$(echo $DATABASE_URL | grep :// | sed -e's,^\(.*://\).*,\1,g')"
-  url="$(echo $DATABASE_URL | sed -e s,$proto,,g)"
-
-  # extract the user and password (if any)
-  userpass=$(echo $url | grep @ | sed -r 's/^(.*)@([^@]*)$/\1/')
-  DB_PASSWORD="$(echo $userpass | grep : | cut -d: -f2)"
-  if [ -n "$DB_PASSWORD" ]; then
-    DB_USER=$(echo $userpass | grep : | cut -d: -f1)
-  else
-    DB_USER=$userpass
-  fi
-
-  # extract the host -- updated
-  hostport=`echo $url | sed -e s,$userpass@,,g | cut -d/ -f1`
-  port=`echo $hostport | grep : | cut -d: -f2`
-  if [ -n "$port" ]; then
-      DB_HOST=`echo $hostport | grep : | cut -d: -f1`
-      DB_PORT=$port
-  else
-      DB_HOST=$hostport
-  fi
-
-  DB_NAME="$(echo $url | grep / | cut -d/ -f2-)"
-fi
-
-# Write the password with MD5 encryption, to avoid printing it during startup.
-# Notice that `docker inspect` will show unencrypted env variables.
+PG_CONFIG_FILE="${PG_CONFIG_DIR}/pgbouncer.ini"
 _AUTH_FILE="${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}"
 
 # Workaround userlist.txt missing issue
@@ -47,44 +16,116 @@ if [ ! -e "${_AUTH_FILE}" ]; then
   touch "${_AUTH_FILE}"
 fi
 
-if [ -n "$DB_USER" -a -n "$DB_PASSWORD" -a -e "${_AUTH_FILE}" ] && ! grep -q "^\"$DB_USER\"" "${_AUTH_FILE}"; then
-  if [ "$AUTH_TYPE" != "plain" ]; then
-     pass="md5$(echo -n "$DB_PASSWORD$DB_USER" | md5sum | cut -f 1 -d ' ')"
+# Extract all info from a given URL. Sets variables because shell functions can't return multiple values.
+#
+# Parameters:
+#   - The url we should parse
+# Returns (sets variables): DB_USER, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME
+parse_url() {
+  # Thanks to https://stackoverflow.com/a/17287984/146289
+
+  # Allow to pass values like dj-database-url / django-environ accept
+  proto="$(echo $1 | grep :// | sed -e's,^\(.*://\).*,\1,g')"
+  url="$(echo $1 | sed -e s,$proto,,g)"
+
+  # extract the user and password (if any)
+  userpass="$(echo $url | grep @ | sed -r 's/^(.*)@([^@]*)$/\1/')"
+  DB_PASSWORD="$(echo $userpass | grep : | cut -d: -f2)"
+  if [ -n "${DB_PASSWORD}" ]; then
+    DB_USER="$(echo $userpass | grep : | cut -d: -f1)"
   else
-     pass="$DB_PASSWORD"
+    DB_USER="${userpass}"
   fi
-  echo "\"$DB_USER\" \"$pass\"" >> ${PG_CONFIG_DIR}/userlist.txt
-  echo "Wrote authentication credentials to ${PG_CONFIG_DIR}/userlist.txt"
+
+  # extract the host -- updated
+  hostport=`echo $url | sed -e s,$userpass@,,g | cut -d/ -f1`
+  port=`echo $hostport | grep : | cut -d: -f2`
+  if [ -n "$port" ]; then
+    DB_HOST=`echo $hostport | grep : | cut -d: -f1`
+    DB_PORT="${port}"
+  else
+    DB_HOST="${hostport}"
+  fi
+
+  DB_NAME="$(echo $url | grep / | cut -d/ -f2-)"
+}
+
+# Grabs variables set by `parse_url` and adds them to the userlist if not already set in there.
+generate_userlist_if_needed() {
+  if [ -n "${DB_USER}" -a -n "${DB_PASSWORD}" -a -e "${_AUTH_FILE}" ] && ! grep -q "^\"${DB_USER}\"" "${_AUTH_FILE}"; then
+    if [ "${AUTH_TYPE}" = "plain" ] || [ "${AUTH_TYPE}" = "scram-sha-256" ]; then
+      pass="${DB_PASSWORD}"
+    else
+      pass="md5$(echo -n "${DB_PASSWORD}${DB_USER}" | md5sum | cut -f 1 -d ' ')"
+    fi
+    echo "\"${DB_USER}\" \"${pass}\"" >> "${_AUTH_FILE}"
+    echo "Wrote authentication credentials for '${DB_USER}' to ${_AUTH_FILE}"
+  fi
+}
+
+# Grabs variables set by `parse_url` and adds them to the PG config file as a database entry.
+generate_config_db_entry() {
+  printf "\
+${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
+port=${DB_PORT:-5432} auth_user=${DB_USER:-postgres}
+${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
+" >> "${PG_CONFIG_FILE}"
+}
+
+# Write the password with MD5 encryption, to avoid printing it during startup.
+# Notice that `docker inspect` will show unencrypted env variables.
+if [ -n "${DATABASE_URLS}" ]; then
+  echo "${DATABASE_URLS}" | tr , '\n' | while read url; do
+    parse_url "$url"
+    generate_userlist_if_needed
+  done
+else
+  if [ -n "${DATABASE_URL}" ]; then
+    parse_url "${DATABASE_URL}"
+  fi
+  generate_userlist_if_needed
 fi
 
-if [ ! -f ${PG_CONFIG_DIR}/pgbouncer.ini ]; then
-  echo "Create pgbouncer config in ${PG_CONFIG_DIR}"
+if [ ! -f "${PG_CONFIG_FILE}" ]; then
+  echo "Creating pgbouncer config in ${PG_CONFIG_DIR}"
 
-# Config file is in “ini” format. Section names are between “[” and “]”.
-# Lines starting with “;” or “#” are taken as comments and ignored.
-# The characters “;” and “#” are not recognized when they appear later in the line.
+  # Config file is in "ini" format. Section names are between "[" and "]".
+  # Lines starting with ";" or "#" are taken as comments and ignored.
+  # The characters ";" and "#" are not recognized when they appear later in the line.
   printf "\
 ################## Auto generated ##################
 [databases]
-${DB_NAME:-*} = host=${DB_HOST:?"Setup pgbouncer config error! You must set DB_HOST env"} \
-port=${DB_PORT:-5432} user=${DB_USER:-postgres}
-${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
+" > "${PG_CONFIG_FILE}"
 
+  if [ -n "$DATABASE_URLS" ]; then
+    echo "$DATABASE_URLS" | tr , '\n' | while read url; do
+      parse_url "$url"
+      generate_config_db_entry
+    done
+  else
+    if [ -n "$DATABASE_URL" ]; then
+      parse_url "$DATABASE_URL"
+    fi
+    generate_config_db_entry
+  fi
+
+  printf "\
 [pgbouncer]
 listen_addr = ${LISTEN_ADDR:-0.0.0.0}
 listen_port = ${LISTEN_PORT:-5432}
-unix_socket_dir =
+unix_socket_dir = ${UNIX_SOCKET_DIR}
 user = postgres
-auth_file = ${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}
+auth_file = ${_AUTH_FILE}
 ${AUTH_HBA_FILE:+auth_hba_file = ${AUTH_HBA_FILE}\n}\
 auth_type = ${AUTH_TYPE:-md5}
 ${AUTH_USER:+auth_user = ${AUTH_USER}\n}\
 ${AUTH_QUERY:+auth_query = ${AUTH_QUERY}\n}\
+${AUTH_DBNAME:+auth_dbname = ${AUTH_DBNAME}\n}\
 ${POOL_MODE:+pool_mode = ${POOL_MODE}\n}\
 ${MAX_CLIENT_CONN:+max_client_conn = ${MAX_CLIENT_CONN}\n}\
+${POOL_SIZE:+pool_size = ${POOL_SIZE}\n}\
 ${DEFAULT_POOL_SIZE:+default_pool_size = ${DEFAULT_POOL_SIZE}\n}\
 ${MIN_POOL_SIZE:+min_pool_size = ${MIN_POOL_SIZE}\n}\
-${MAX_PREPARED_STATEMENTS:+max_prepared_statements = ${MAX_PREPARED_STATEMENTS}\n}\
 ${RESERVE_POOL_SIZE:+reserve_pool_size = ${RESERVE_POOL_SIZE}\n}\
 ${RESERVE_POOL_TIMEOUT:+reserve_pool_timeout = ${RESERVE_POOL_TIMEOUT}\n}\
 ${MAX_DB_CONNECTIONS:+max_db_connections = ${MAX_DB_CONNECTIONS}\n}\
@@ -93,6 +134,8 @@ ${SERVER_ROUND_ROBIN:+server_round_robin = ${SERVER_ROUND_ROBIN}\n}\
 ignore_startup_parameters = ${IGNORE_STARTUP_PARAMETERS:-extra_float_digits}
 ${DISABLE_PQEXEC:+disable_pqexec = ${DISABLE_PQEXEC}\n}\
 ${APPLICATION_NAME_ADD_HOST:+application_name_add_host = ${APPLICATION_NAME_ADD_HOST}\n}\
+${TIMEZONE:+timezone = ${TIMEZONE}\n}\
+${MAX_PREPARED_STATEMENTS:+max_prepared_statements = ${MAX_PREPARED_STATEMENTS}\n}\
 
 # Log settings
 ${LOG_CONNECTIONS:+log_connections = ${LOG_CONNECTIONS}\n}\
@@ -103,6 +146,7 @@ ${STATS_PERIOD:+stats_period = ${STATS_PERIOD}\n}\
 ${VERBOSE:+verbose = ${VERBOSE}\n}\
 admin_users = ${ADMIN_USERS:-postgres}
 ${STATS_USERS:+stats_users = ${STATS_USERS}\n}\
+${LOGFILE:+logfile = ${LOGFILE}\n}\
 
 # Connection sanity checks, timeouts
 ${SERVER_RESET_QUERY:+server_reset_query = ${SERVER_RESET_QUERY}\n}\
@@ -151,9 +195,9 @@ ${TCP_KEEPIDLE:+tcp_keepidle = ${TCP_KEEPIDLE}\n}\
 ${TCP_KEEPINTVL:+tcp_keepintvl = ${TCP_KEEPINTVL}\n}\
 ${TCP_USER_TIMEOUT:+tcp_user_timeout = ${TCP_USER_TIMEOUT}\n}\
 ################## end file ##################
-" > ${PG_CONFIG_DIR}/pgbouncer.ini
-cat ${PG_CONFIG_DIR}/pgbouncer.ini
-echo "Starting $*..."
+" >> "${PG_CONFIG_FILE}"
+  cat "${PG_CONFIG_FILE}"
 fi
 
+echo "Starting $*..."
 exec "$@"
