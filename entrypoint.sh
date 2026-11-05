@@ -10,6 +10,13 @@ PG_CONFIG_DIR=/etc/pgbouncer
 PG_CONFIG_FILE="${PG_CONFIG_DIR}/pgbouncer.ini"
 _AUTH_FILE="${AUTH_FILE:-$PG_CONFIG_DIR/userlist.txt}"
 
+# Default to SCRAM. With md5, userlist.txt holds only an MD5 hash, and an MD5
+# hash cannot answer a SCRAM challenge from Postgres. That took prod down on
+# 2026-11-05 when the server started to ask for SCRAM. With scram-sha-256 (or
+# plain), userlist.txt holds the real password, which can answer MD5 or SCRAM.
+# Set AUTH_TYPE=md5 explicitly to keep the old behaviour.
+AUTH_TYPE="${AUTH_TYPE:-scram-sha-256}"
+
 # Workaround userlist.txt missing issue
 # https://github.com/edoburu/docker-pgbouncer/issues/33
 if [ ! -e "${_AUTH_FILE}" ]; then
@@ -72,7 +79,9 @@ ${CLIENT_ENCODING:+client_encoding = ${CLIENT_ENCODING}\n}\
 " >> "${PG_CONFIG_FILE}"
 }
 
-# Write the password with MD5 encryption, to avoid printing it during startup.
+# Write the credentials to userlist.txt. With AUTH_TYPE=md5 the password is
+# stored as an MD5 hash; with scram-sha-256 or plain it is stored as is,
+# because PgBouncer needs the real password to answer a SCRAM challenge.
 # Notice that `docker inspect` will show unencrypted env variables.
 if [ -n "${DATABASE_URLS}" ]; then
   echo "${DATABASE_URLS}" | tr , '\n' | while read url; do
@@ -117,7 +126,7 @@ unix_socket_dir = ${UNIX_SOCKET_DIR}
 user = postgres
 auth_file = ${_AUTH_FILE}
 ${AUTH_HBA_FILE:+auth_hba_file = ${AUTH_HBA_FILE}\n}\
-auth_type = ${AUTH_TYPE:-md5}
+auth_type = ${AUTH_TYPE}
 ${AUTH_USER:+auth_user = ${AUTH_USER}\n}\
 ${AUTH_QUERY:+auth_query = ${AUTH_QUERY}\n}\
 ${AUTH_DBNAME:+auth_dbname = ${AUTH_DBNAME}\n}\

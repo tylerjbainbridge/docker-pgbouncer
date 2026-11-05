@@ -12,7 +12,7 @@ Features:
 * Configurable using environment variables
 * Uses standard Postgres port 5432, to work transparently for applications.
 * Includes PostgreSQL client tools such as ``psql``, ``pg_isready``
-* MD5 authentication by default.
+* SCRAM-SHA-256 authentication by default. Set `AUTH_TYPE=md5` for the old MD5 behaviour, but note that an MD5 hash in `userlist.txt` cannot log in to a Postgres server that asks for SCRAM.
 * `/etc/pgbouncer/pgbouncer.ini` and `/etc/pbbouncer/userlist.txt` are auto-created if they don't exist.
 
 
